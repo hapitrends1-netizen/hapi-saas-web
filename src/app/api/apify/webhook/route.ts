@@ -5,14 +5,15 @@ import { ensureSupabaseServer } from '@/lib/supabaseClient';
 type AnyObj = Record<string, any>;
 
 async function parseRequestBody(req: Request): Promise<any> {
-  // prova a leggere come JSON; se fallisce prova a leggere testo e parsare
   try {
+    // prova a leggere come JSON (fetch/axios style)
     return await req.json();
-  } catch (err) {
+  } catch {
+    // fallback: leggi come testo e prova a parsare
     try {
       const txt = await req.text();
       return txt ? JSON.parse(txt) : null;
-    } catch (err2) {
+    } catch {
       return null;
     }
   }
@@ -24,7 +25,6 @@ function extractItems(body: AnyObj): any[] {
   if (Array.isArray(body.items)) return body.items;
   if (Array.isArray(body.data?.items)) return body.data.items;
   if (Array.isArray(body.resource?.items)) return body.resource.items;
-  // a volte Apify mette i dati in body.run.fields o simili; fallback:
   if (Array.isArray(body.data)) return body.data;
   return [];
 }
@@ -34,15 +34,15 @@ export async function POST(req: Request) {
     // 1) parse body
     const body = await parseRequestBody(req);
 
-    // 2) secret check
-    const headerSecret = req.headers.get('x-webhook-secret') ?? '';
-    const expectedSecret = process.env.WEBHOOK_SECRET ?? '';
+    // 2) verifica secret header vs env
+    const headerSecret = (req.headers.get('x-webhook-secret') ?? '').toString();
+    const expectedSecret = (process.env.WEBHOOK_SECRET ?? '').toString();
     if (!expectedSecret) {
       console.error('[webhook] WEBHOOK_SECRET non configurata in env');
       return NextResponse.json({ ok: false, error: 'server misconfigured' }, { status: 500 });
     }
     if (headerSecret !== expectedSecret) {
-      console.warn('[webhook] secret mismatch', { headerSecret });
+      console.warn('[webhook] Webhook secret mismatch', { headerSecret });
       return NextResponse.json({ ok: false, error: 'forbidden' }, { status: 403 });
     }
 
@@ -63,7 +63,7 @@ export async function POST(req: Request) {
       dataset_id: datasetId,
       run_id: runId,
       payload: it,
-      inserted_at: new Date().toISOString()
+      inserted_at: new Date().toISOString(),
     }));
 
     // 5) ottieni supabase server client (throws se non configurato)
@@ -75,7 +75,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: 'server misconfigured (supabase)' }, { status: 500 });
     }
 
-    // 6) esegui upsert (usa schema pubblico implicito "results")
+    // 6) esegui upsert -> usa 'results' (schema pubblico implicito) e onConflict string
     const { data: upsertData, error: upsertError } = await supabase
       .from('results')
       .upsert(rows as any, { onConflict: 'apify_id' })
