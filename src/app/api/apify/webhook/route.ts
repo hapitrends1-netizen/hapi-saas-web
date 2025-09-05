@@ -1,83 +1,97 @@
 // src/app/api/apify/webhook/route.ts
 import { NextResponse } from 'next/server';
-import { getSupabaseServer } from '@/lib/supabaseClient';
+import { ensureSupabaseServer } from '@/lib/supabaseClient';
+
+type AnyObj = Record<string, any>;
+
+async function parseRequestBody(req: Request): Promise<any> {
+  // prova a leggere come JSON; se fallisce prova a leggere testo e parsare
+  try {
+    return await req.json();
+  } catch (err) {
+    try {
+      const txt = await req.text();
+      return txt ? JSON.parse(txt) : null;
+    } catch (err2) {
+      return null;
+    }
+  }
+}
+
+function extractItems(body: AnyObj): any[] {
+  if (!body) return [];
+  if (Array.isArray(body.datasetItems)) return body.datasetItems;
+  if (Array.isArray(body.items)) return body.items;
+  if (Array.isArray(body.data?.items)) return body.data.items;
+  if (Array.isArray(body.resource?.items)) return body.resource.items;
+  // a volte Apify mette i dati in body.run.fields o simili; fallback:
+  if (Array.isArray(body.data)) return body.data;
+  return [];
+}
 
 export async function POST(req: Request) {
   try {
-    // parse headers
-    for (const [k,v] of req.headers) {
-      // log se ti serve: console.debug(k, v);
-    }
+    // 1) parse body
+    const body = await parseRequestBody(req);
 
-    // parse body JSON
-    let body: any;
-    try { body = await req.json(); } catch (e) {
-      console.error('Webhook: invalid JSON', e);
-      return NextResponse.json({ ok:false, error: 'invalid json' }, { status: 400 });
-    }
-
-    // secret header check
+    // 2) secret check
     const headerSecret = req.headers.get('x-webhook-secret') ?? '';
     const expectedSecret = process.env.WEBHOOK_SECRET ?? '';
     if (!expectedSecret) {
-      console.error('WEBHOOK_SECRET non impostata in env');
-      return NextResponse.json({ ok:false, error: 'server misconfigured - missing WEBHOOK_SECRET' }, { status: 500 });
+      console.error('[webhook] WEBHOOK_SECRET non configurata in env');
+      return NextResponse.json({ ok: false, error: 'server misconfigured' }, { status: 500 });
     }
     if (headerSecret !== expectedSecret) {
-      console.warn('Webhook secret mismatch', { headerSecret });
-      return NextResponse.json({ ok:false, error: 'forbidden' }, { status: 403 });
+      console.warn('[webhook] secret mismatch', { headerSecret });
+      return NextResponse.json({ ok: false, error: 'forbidden' }, { status: 403 });
     }
 
-    // attempt to build supabase client (throws if missing env)
-    let supabase;
-    try {
-      supabase = getSupabaseServer();
-    } catch (err: any) {
-      console.error('Supabase client error:', err?.message ?? err);
-      return NextResponse.json({ ok:false, error: 'server misconfigured - supabase not available' }, { status: 500 });
-    }
+    // 3) estrai items e meta
+    const items: any[] = extractItems(body);
+    const datasetId = body?.datasetId ?? body?.defaultDatasetId ?? body?.resource?.defaultDatasetId ?? null;
+    const runId = body?.runId ?? body?.id ?? body?.resource?.id ?? null;
 
-    // normalizza items (diverse forme possibili)
-    const items: any[] = Array.isArray(body?.datasetItems)
-      ? body.datasetItems
-      : Array.isArray(body?.items)
-      ? body.items
-      : Array.isArray(body?.data?.items)
-      ? body.data.items
-      : [];
-
-    const datasetId = body?.datasetId ?? body?.defaultDatasetId ?? null;
-    const runId = body?.runId ?? body?.id ?? null;
-
-    console.log(`Webhook received items=${items.length} datasetId=${datasetId} runId=${runId}`);
+    console.log(`[webhook] received datasetId=${datasetId} runId=${runId} items=${items.length}`);
 
     if (!Array.isArray(items) || items.length === 0) {
-      return NextResponse.json({ ok:true, inserted: 0, note: 'no_items' }, { status: 200 });
+      return NextResponse.json({ ok: true, inserted: 0, note: 'no_items' }, { status: 200 });
     }
 
-    // prepara righe per upsert
+    // 4) prepara righe per DB
     const rows = items.map((it: any) => ({
-      apify_id: it._id ?? it.id ?? `${datasetId || 'ds'}::${Math.random().toString(36).slice(2,9)}`,
+      apify_id: it._id ?? it.id ?? `${datasetId || 'ds'}::${Math.random().toString(36).slice(2, 9)}`,
       dataset_id: datasetId,
-      payload: it
+      run_id: runId,
+      payload: it,
+      inserted_at: new Date().toISOString()
     }));
 
-    // ESEGUI upsert: usa tabella 'results' e onConflict come stringa
-    const { data, error } = await supabase
-      .from('results')
-      .upsert(rows, { onConflict: 'apify_id' })
-      .select();
-
-    if (error) {
-      console.error('Supabase upsert error', error);
-      return NextResponse.json({ ok:false, error: error }, { status: 500 });
+    // 5) ottieni supabase server client (throws se non configurato)
+    let supabase;
+    try {
+      supabase = ensureSupabaseServer();
+    } catch (e: any) {
+      console.error('[webhook] supabase not configured:', e?.message ?? e);
+      return NextResponse.json({ ok: false, error: 'server misconfigured (supabase)' }, { status: 500 });
     }
 
-    console.log('Upsert OK, inserted', (data || []).length);
-    return NextResponse.json({ ok:true, inserted: (data || []).length }, { status: 200 });
+    // 6) esegui upsert (usa schema pubblico implicito "results")
+    const { data: upsertData, error: upsertError } = await supabase
+      .from('results')
+      .upsert(rows as any, { onConflict: 'apify_id' })
+      .select();
 
-  } catch (unexpected: any) {
-    console.error('Webhook unexpected error', unexpected);
-    return NextResponse.json({ ok:false, error: unexpected?.message ?? 'server error' }, { status: 500 });
+    if (upsertError) {
+      console.error('[webhook] supabase upsert error', upsertError);
+      return NextResponse.json({ ok: false, error: upsertError }, { status: 500 });
+    }
+
+    const inserted = Array.isArray(upsertData) ? upsertData.length : 0;
+    console.log(`[webhook] upsert OK inserted=${inserted}`);
+
+    return NextResponse.json({ ok: true, inserted }, { status: 200 });
+  } catch (err: any) {
+    console.error('[webhook] unexpected error', err);
+    return NextResponse.json({ ok: false, error: err?.message ?? 'server error' }, { status: 500 });
   }
 }
