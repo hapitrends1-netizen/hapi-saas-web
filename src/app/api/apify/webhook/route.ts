@@ -2,9 +2,7 @@
 import { NextResponse } from 'next/server';
 import { ensureSupabaseServer } from '@/lib/supabaseClient';
 
-// forza l'esecuzione su Node.js (no edge), utile per librerie server-side
 export const runtime = 'nodejs';
-// niente cache su questa API
 export const dynamic = 'force-dynamic';
 
 type AnyObj = Record<string, any>;
@@ -32,14 +30,14 @@ function extractItems(body: AnyObj): any[] {
   return [];
 }
 
-// GET di prova per verificare che la route sia deployata
+// GET di prova: deve rispondere 200 se la route è deployata
 export async function GET() {
   return NextResponse.json({ ok: true, route: '/api/apify/webhook', method: 'GET' }, { status: 200 });
 }
 
 export async function POST(req: Request) {
   try {
-    // 1) parse
+    // 1) body
     const body = await parseRequestBody(req);
 
     // 2) secret
@@ -54,27 +52,26 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: 'forbidden' }, { status: 403 });
     }
 
-    // 3) estrazione dati
-    const items: any[] = extractItems(body);
-    const datasetId = body?.datasetId ?? body?.defaultDatasetId ?? body?.resource?.defaultDatasetId ?? null;
-    const runId = body?.runId ?? body?.id ?? body?.resource?.id ?? null;
+    // 3) items
+    const items = extractItems(body);
+    const datasetId =
+      body?.datasetId ?? body?.defaultDatasetId ?? body?.resource?.defaultDatasetId ?? null;
 
-    console.log(`[webhook] received datasetId=${datasetId} runId=${runId} items=${items.length}`);
+    console.log(`[webhook] received datasetId=${datasetId} items=${items.length}`);
 
     if (!Array.isArray(items) || items.length === 0) {
       return NextResponse.json({ ok: true, inserted: 0, note: 'no_items' }, { status: 200 });
     }
 
-    // 4) righe
+    // 4) righe per tabella public.results (apify_id, dataset_id, payload, inserted_at)
     const rows = items.map((it: any) => ({
       apify_id: it._id ?? it.id ?? `${datasetId || 'ds'}::${Math.random().toString(36).slice(2, 9)}`,
       dataset_id: datasetId,
-      run_id: runId,
       payload: it,
       inserted_at: new Date().toISOString(),
     }));
 
-    // 5) supabase client
+    // 5) supabase
     let supabase;
     try {
       supabase = ensureSupabaseServer();
@@ -83,7 +80,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: 'server misconfigured (supabase)' }, { status: 500 });
     }
 
-    // 6) upsert nella tabella "results" (schema pubblico di default)
+    // 6) upsert nella tabella "results" dello schema pubblico
     const { data: upsertData, error: upsertError } = await supabase
       .from('results')
       .upsert(rows as any, { onConflict: 'apify_id' })
